@@ -1,0 +1,890 @@
+---
+title: "pharmaverse raw-to-ADaM-to-TLG pipeline"
+format:
+  html:
+    code-fold: show
+    code-tools: true
+---
+
+::: {.callout-note}
+This report was generated using AI under general human direction. At the time of generation, the contents have not been comprehensively reviewed by a human analyst.
+
+<!--
+To indicate human review: Delete the line above about contents not being reviewed, and replace this comment with:
+The contents have been reviewed and validated by [Your Name], [Your Role] on [Date].
+-->
+:::
+
+## Overview
+
+This report ties together an end-to-end clinical reporting pipeline, adapted from the [pharmaverse examples](https://pharmaverse.github.io/examples/) site, scoped to a core slice: the Demographics (`DM`) and Adverse Events (`AE`) domains, from raw data through SDTM, ADaM (`ADSL`/`ADAE`), and two TLG (Tables, Listings, Graphs) outputs.
+
+Every code cell below is shown by default and can be individually collapsed (click "Hide"), or all cells can be shown/hidden at once via the "Code" menu in the top right of the page.
+
+### Data flow
+
+```{mermaid}
+%%| fig-cap: "Raw data to SDTM to ADaM to TLG, for the DM/AE domains covered here"
+flowchart LR
+    RAW["Raw data (XPT)\nDM \u00b7 DS \u00b7 EC \u00b7 AE"]
+    SDTMDM["SDTM DM\n{sdtm.oak}"]
+    SDTMAE["SDTM AE\n{sdtm.oak}"]
+    ADSL["ADaM ADSL\n{admiral} {metacore}\n{metatools} {xportr}"]
+    ADAE["ADaM ADAE\n{admiral} {metacore}\n{metatools} {xportr}"]
+    DEMOTBL["Demographics table\n{rtables} {tern}"]
+    AETBL["Adverse events table\n{rtables} {tern}"]
+    PLOTS["Supporting plots\n{ggplot2}"]
+    OUT["Outputs\nXPT \u00b7 PDF \u00b7 PNG"]
+
+    RAW --> SDTMDM --> ADSL
+    RAW --> SDTMAE --> ADAE
+    ADSL --> ADAE
+    ADSL --> DEMOTBL
+    ADSL --> AETBL
+    ADAE --> AETBL
+    ADSL --> PLOTS
+    ADAE --> PLOTS
+    DEMOTBL --> OUT
+    AETBL --> OUT
+    PLOTS --> OUT
+
+    style RAW fill:#d6eaf8,stroke:#2e86c1,color:#000
+    style SDTMDM fill:#2e86c1,stroke:#1a5276,color:#fff
+    style SDTMAE fill:#2e86c1,stroke:#1a5276,color:#fff
+    style ADSL fill:#2e86c1,stroke:#1a5276,color:#fff
+    style ADAE fill:#2e86c1,stroke:#1a5276,color:#fff
+    style DEMOTBL fill:#1e8449,stroke:#145a32,color:#fff
+    style AETBL fill:#1e8449,stroke:#145a32,color:#fff
+    style PLOTS fill:#1e8449,stroke:#145a32,color:#fff
+    style OUT fill:#d5f5e3,stroke:#1e8449,color:#000
+```
+
+Each stage below mirrors a numbered script under `scripts/` in the project (`01_sdtm_dm.R` through `08_tlg_plots.R`); this report re-runs that same logic end to end so the tables, plots, and narrative stay in sync with the underlying pipeline.
+
+### Scope
+
+- **SDTM**: `DM` and `AE` domains only, mapped from raw data with `{sdtm.oak}`.
+- **ADaM**: `ADSL` and `ADAE`, built with `{admiral}`, `{metacore}`, `{metatools}`, and `{xportr}` (including eSub XPT export). `ADSL` uses the `{pharmaversesdtm}` `DM`/`DS`/`EX`/`AE`/`VS`/`SUPPDM` domains directly, since it needs `DS`/`EX`/`VS`/`SUPPDM` inputs that are outside the raw-to-SDTM scope above.
+- **TLG**: a Demographics table and an Adverse Events table (`{rtables}`/`{tern}`), exported to PDF, plus two supporting `{ggplot2}` plots. The Adverse Events table and its companion plot use the `{pharmaverseadam}` reference `ADAE`, because the abbreviated spec file used for the `ADAE` derivation here doesn't carry the full MedDRA hierarchy variables (`AEBODSYS`/`AEDECOD`/etc.) that table needs -- this mirrors how the pharmaverse examples site itself sources data for its TLG articles.
+
+## Setup
+
+```{r}
+#| label: load-packages
+library(sdtm.oak)
+library(haven)
+library(dplyr)
+library(tidyr)
+library(lubridate)
+library(stringr)
+library(metacore)
+library(metatools)
+library(admiral)
+library(xportr)
+library(pharmaversesdtm)
+library(pharmaverseadam)
+library(rtables)
+library(tern)
+library(ggplot2)
+library(scales)
+```
+
+Raw datasets are read from local SAS transport (XPT) files under `input_data/` (originally exported from `{pharmaverseraw}`; see `scripts/00_export_raw_to_xpt.R`). Because XPT variable names can't contain ".", the `IT.` item-prefix used throughout these raw datasets (e.g. `IT.AGE`) was saved as `IT_` and is restored here on read-in. Controlled terminology and the ADaM `{metacore}` specification are read from `metadata/`.
+
+```{r}
+#| label: load-data
+restore_it_prefix <- function(df) {
+  names(df) <- sub("^IT_", "IT.", names(df))
+  df
+}
+
+dm_raw <- restore_it_prefix(read_xpt("input_data/dm_raw.xpt"))
+ds_raw <- restore_it_prefix(read_xpt("input_data/ds_raw.xpt"))
+ec_raw <- restore_it_prefix(read_xpt("input_data/ec_raw.xpt"))
+ae_raw <- restore_it_prefix(read_xpt("input_data/ae_raw.xpt"))
+
+study_ct <- read.csv("metadata/sdtm_ct.csv")
+```
+
+## SDTM: mapping raw data
+
+### Demographics (DM)
+
+`{sdtm.oak}` maps raw item-level columns to SDTM variables using `oak_id_vars` for traceability, `assign_ct()`/`assign_no_ct()` for variable-level mapping (with or without controlled terminology), and `oak_cal_ref_dates()` to derive reference dates such as `RFSTDTC`/`RFXSTDTC` from the raw exposure and disposition data.
+
+```{r}
+#| label: sdtm-dm-id-vars
+dm_raw <- dm_raw %>%
+  generate_oak_id_vars(pat_var = "PATNUM", raw_src = "dm_raw")
+
+ds_raw <- ds_raw %>%
+  generate_oak_id_vars(pat_var = "PATNUM", raw_src = "ds_raw")
+
+ec_raw <- ec_raw %>%
+  generate_oak_id_vars(pat_var = "PATNUM", raw_src = "ec_raw")
+```
+
+```{r}
+#| label: sdtm-dm-ref-dates-config
+ref_date_conf_df <- tibble::tribble(
+  ~raw_dataset_name, ~date_var,     ~time_var,      ~dformat,      ~tformat, ~sdtm_var_name,
+  "ec_raw",       "IT.ECSTDAT", NA_character_, "dd-mmm-yyyy", NA_character_,     "RFXSTDTC",
+  "ec_raw",       "IT.ECENDAT", NA_character_, "dd-mmm-yyyy", NA_character_,     "RFXENDTC",
+  "ec_raw",       "IT.ECSTDAT", NA_character_, "dd-mmm-yyyy", NA_character_,      "RFSTDTC",
+  "ec_raw",       "IT.ECENDAT", NA_character_, "dd-mmm-yyyy", NA_character_,      "RFENDTC",
+  "dm_raw",            "IC_DT", NA_character_,  "mm/dd/yyyy", NA_character_,      "RFICDTC",
+  "ds_raw",          "DSDTCOL",     "DSTMCOL",  "mm-dd-yyyy",         "H:M",     "RFPENDTC",
+  "ds_raw",          "DEATHDT", NA_character_,  "mm/dd/yyyy", NA_character_,       "DTHDTC"
+)
+```
+
+```{r}
+#| label: sdtm-dm-map-vars
+# Topic variable
+dm <- dm_raw %>%
+  mutate(SUBJID = substr(PATNUM, 5, 8)) %>%
+  select(oak_id, raw_source, patient_number, SUBJID)
+
+# Qualifier / demographic variables
+dm <- dm %>%
+  assign_no_ct(
+    raw_dat = dm_raw, raw_var = "IT.AGE", tgt_var = "AGE",
+    id_vars = oak_id_vars()
+  ) %>%
+  hardcode_ct(
+    raw_dat = dm_raw, raw_var = "IT.AGE", tgt_var = "AGEU", tgt_val = "Year",
+    ct_spec = study_ct, ct_clst = "C66781", id_vars = oak_id_vars()
+  ) %>%
+  assign_ct(
+    raw_dat = dm_raw, raw_var = "IT.SEX", tgt_var = "SEX",
+    ct_spec = study_ct, ct_clst = "C66731", id_vars = oak_id_vars()
+  ) %>%
+  assign_ct(
+    raw_dat = dm_raw, raw_var = "IT.ETHNIC", tgt_var = "ETHNIC",
+    ct_spec = study_ct, ct_clst = "C66790", id_vars = oak_id_vars()
+  ) %>%
+  assign_ct(
+    raw_dat = dm_raw, raw_var = "IT.RACE", tgt_var = "RACE",
+    ct_spec = study_ct, ct_clst = "C74457", id_vars = oak_id_vars()
+  ) %>%
+  assign_ct(
+    raw_dat = dm_raw, raw_var = "PLANNED_ARM", tgt_var = "ARM",
+    ct_spec = study_ct, ct_clst = "ARM", id_vars = oak_id_vars()
+  ) %>%
+  assign_no_ct(
+    raw_dat = dm_raw, raw_var = "PLANNED_ARMCD", tgt_var = "ARMCD",
+    id_vars = oak_id_vars()
+  ) %>%
+  assign_ct(
+    raw_dat = dm_raw, raw_var = "ACTUAL_ARM", tgt_var = "ACTARM",
+    ct_spec = study_ct, ct_clst = "ARM", id_vars = oak_id_vars()
+  ) %>%
+  assign_no_ct(
+    raw_dat = dm_raw, raw_var = "ACTUAL_ARMCD", tgt_var = "ACTARMCD",
+    id_vars = oak_id_vars()
+  )
+
+# Reference dates
+raw_source_list <- list(ec_raw = ec_raw, ds_raw = ds_raw, dm_raw = dm_raw)
+
+dm <- dm %>%
+  oak_cal_ref_dates(ds_in = ., der_var = "RFSTDTC", min_max = "min",
+                     ref_date_config_df = ref_date_conf_df, raw_source = raw_source_list) %>%
+  oak_cal_ref_dates(ds_in = ., der_var = "RFENDTC", min_max = "max",
+                     ref_date_config_df = ref_date_conf_df, raw_source = raw_source_list) %>%
+  oak_cal_ref_dates(ds_in = ., der_var = "RFXSTDTC", min_max = "min",
+                     ref_date_config_df = ref_date_conf_df, raw_source = raw_source_list) %>%
+  oak_cal_ref_dates(ds_in = ., der_var = "RFXENDTC", min_max = "max",
+                     ref_date_config_df = ref_date_conf_df, raw_source = raw_source_list) %>%
+  oak_cal_ref_dates(ds_in = ., der_var = "RFICDTC", min_max = "min",
+                     ref_date_config_df = ref_date_conf_df, raw_source = raw_source_list) %>%
+  oak_cal_ref_dates(ds_in = ., der_var = "RFPENDTC", min_max = "max",
+                     ref_date_config_df = ref_date_conf_df, raw_source = raw_source_list) %>%
+  oak_cal_ref_dates(ds_in = ., der_var = "DTHDTC", min_max = "min",
+                     ref_date_config_df = ref_date_conf_df, raw_source = raw_source_list)
+
+# SDTM identifiers and derived variables
+dm <- dm %>%
+  mutate(
+    STUDYID = dm_raw$STUDY,
+    DOMAIN = "DM",
+    USUBJID = paste0("01-", dm_raw$PATNUM),
+    COUNTRY = dm_raw$COUNTRY,
+    DTHFL = dplyr::if_else(is.na(DTHDTC), NA_character_, "Y")
+  ) %>%
+  assign_datetime(
+    raw_dat = dm_raw, raw_var = "COL_DT", tgt_var = "DMDTC",
+    raw_fmt = c("m/d/y"), id_vars = oak_id_vars()
+  ) %>%
+  derive_study_day(
+    sdtm_in = ., dm_domain = ., tgdt = "DMDTC", refdt = "RFXSTDTC",
+    study_day_var = "DMDY"
+  )
+```
+
+The derived SDTM `DM` domain has `{r} nrow(dm)` subjects and `{r} ncol(dm)` variables:
+
+```{r}
+#| label: sdtm-dm-preview
+dm %>%
+  select(USUBJID, AGE, SEX, RACE, ARM, ACTARM, RFSTDTC, RFXSTDTC) %>%
+  head(10)
+```
+
+### Adverse events (AE)
+
+The `AE` domain follows the same pattern: `AETERM` is mapped as the topic variable, the remaining qualifier/timing variables are mapped with `assign_ct()`/`assign_no_ct()`/`assign_datetime()`, and `derive_seq()`/`derive_study_day()` add the sequence number and study day relative to `RFXSTDTC`/`RFXENDTC` from the `DM` domain built above.
+
+```{r}
+#| label: sdtm-ae-map
+ae_raw <- ae_raw %>%
+  generate_oak_id_vars(pat_var = "PATNUM", raw_src = "ae_raw")
+
+# Topic variable -- no tgt_dat/pipe input, so this creates the AE dataset from scratch
+ae <- assign_no_ct(
+  raw_dat = ae_raw, raw_var = "IT.AETERM", tgt_var = "AETERM",
+  id_vars = oak_id_vars()
+)
+
+ae <- ae %>%
+  assign_ct(
+    raw_dat = ae_raw, raw_var = "AEOUTCOME", tgt_var = "AEOUT",
+    ct_spec = study_ct, ct_clst = "C66768", id_vars = oak_id_vars()
+  ) %>%
+  assign_ct(
+    raw_dat = ae_raw, raw_var = "IT.AESEV", tgt_var = "AESEV",
+    ct_spec = study_ct, ct_clst = "C66769", id_vars = oak_id_vars()
+  ) %>%
+  assign_ct(
+    raw_dat = ae_raw, raw_var = "IT.AESER", tgt_var = "AESER",
+    ct_spec = study_ct, ct_clst = "C66742", id_vars = oak_id_vars()
+  ) %>%
+  assign_no_ct(
+    raw_dat = ae_raw, raw_var = "IT.AEACN", tgt_var = "AEACN",
+    id_vars = oak_id_vars()
+  ) %>%
+  assign_ct(
+    raw_dat = ae_raw, raw_var = "IT.AEREL", tgt_var = "AEREL",
+    ct_spec = study_ct, ct_clst = "AEREL", id_vars = oak_id_vars()
+  ) %>%
+  assign_ct(
+    raw_dat = ae_raw, raw_var = "AESCAN", tgt_var = "AESCAN",
+    ct_spec = study_ct, ct_clst = "C66742", id_vars = oak_id_vars()
+  ) %>%
+  assign_ct(
+    raw_dat = ae_raw, raw_var = "AESCNO", tgt_var = "AESCONG",
+    ct_spec = study_ct, ct_clst = "C66742", id_vars = oak_id_vars()
+  ) %>%
+  assign_ct(
+    raw_dat = ae_raw, raw_var = "AEDIS", tgt_var = "AESDISAB",
+    ct_spec = study_ct, ct_clst = "C66742", id_vars = oak_id_vars()
+  ) %>%
+  assign_ct(
+    raw_dat = ae_raw, raw_var = "IT.AESDTH", tgt_var = "AESDTH",
+    ct_spec = study_ct, ct_clst = "C66742", id_vars = oak_id_vars()
+  ) %>%
+  assign_ct(
+    raw_dat = ae_raw, raw_var = "IT.AESHOSP", tgt_var = "AESHOSP",
+    ct_spec = study_ct, ct_clst = "C66742", id_vars = oak_id_vars()
+  ) %>%
+  assign_ct(
+    raw_dat = ae_raw, raw_var = "IT.AESLIFE", tgt_var = "AESLIFE",
+    ct_spec = study_ct, ct_clst = "C66742", id_vars = oak_id_vars()
+  ) %>%
+  assign_ct(
+    raw_dat = ae_raw, raw_var = "AESOD", tgt_var = "AESOD",
+    ct_spec = study_ct, ct_clst = "C66742", id_vars = oak_id_vars()
+  ) %>%
+  assign_datetime(
+    raw_dat = ae_raw, raw_var = "AEDTCOL", tgt_var = "AEDTC",
+    raw_fmt = c("m/d/y")
+  ) %>%
+  assign_datetime(
+    raw_dat = ae_raw, raw_var = "IT.AESTDAT", tgt_var = "AESTDTC",
+    raw_fmt = c("m/d/y"), id_vars = oak_id_vars()
+  ) %>%
+  assign_datetime(
+    raw_dat = ae_raw, raw_var = "IT.AEENDAT", tgt_var = "AEENDTC",
+    raw_fmt = c("m/d/y"), id_vars = oak_id_vars()
+  )
+
+ae <- ae %>%
+  dplyr::mutate(
+    STUDYID = ae_raw$STUDY,
+    DOMAIN = "AE",
+    USUBJID = paste0("01-", ae_raw$PATNUM),
+    AELLT = ae_raw$AELLT,
+    AELLTCD = ae_raw$AELLTCD,
+    AEDECOD = ae_raw$AEDECOD,
+    AEPTCD = ae_raw$AEPTCD,
+    AEHLT = ae_raw$AEHLT,
+    AEHLTCD = ae_raw$AEHLTCD,
+    AEHLGT = ae_raw$AEHLGT,
+    AEHLGTCD = ae_raw$AEHLGTCD,
+    AEBODSYS = ae_raw$AEBODSYS,
+    AEBDSYCD = ae_raw$AEBDSYCD,
+    AESOC = ae_raw$AESOC,
+    AESOCCD = ae_raw$AESOCCD,
+    AETERM = toupper(AETERM)
+  ) %>%
+  derive_seq(tgt_var = "AESEQ", rec_vars = c("USUBJID", "AETERM")) %>%
+  derive_study_day(
+    sdtm_in = ., dm_domain = dm, tgdt = "AESTDTC", refdt = "RFXSTDTC",
+    study_day_var = "AESTDY"
+  ) %>%
+  derive_study_day(
+    sdtm_in = ., dm_domain = dm, tgdt = "AEENDTC", refdt = "RFXENDTC",
+    study_day_var = "AEENDY"
+  ) %>%
+  select(
+    "STUDYID", "DOMAIN", "USUBJID", "AESEQ", "AETERM", "AELLT", "AELLTCD", "AEDECOD", "AEPTCD", "AEHLT", "AEHLTCD", "AEHLGT",
+    "AEHLGTCD", "AEBODSYS", "AEBDSYCD", "AESOC", "AESOCCD", "AESEV", "AESER", "AEACN", "AEREL", "AEOUT", "AESCAN", "AESCONG",
+    "AESDISAB", "AESDTH", "AESHOSP", "AESLIFE", "AESOD", "AEDTC", "AESTDTC", "AEENDTC", "AESTDY", "AEENDY"
+  )
+```
+
+The derived SDTM `AE` domain has `{r} nrow(ae)` records across `{r} n_distinct(ae$USUBJID)` subjects:
+
+```{r}
+#| label: sdtm-ae-preview
+ae %>%
+  select(USUBJID, AETERM, AEBODSYS, AESEV, AESTDTC, AEENDTC, AESTDY) %>%
+  head(10)
+```
+
+## ADaM: building analysis datasets
+
+### ADSL (subject-level analysis dataset)
+
+`ADSL` is built from the `{pharmaversesdtm}` `DM`/`DS`/`EX`/`AE`/`VS`/`SUPPDM` domains (since it needs `DS`/`EX`/`VS`/`SUPPDM`, not built in the SDTM section above). The `{metacore}` specification drives variable derivation and controlled terminology throughout via `{metatools}`, `{admiral}` supplies the clinical derivations (exposure dates, disposition, cause of death, ...), and `{xportr}` applies the final type/length/label metadata before writing the submission-ready XPT file.
+
+```{r}
+#| label: adam-adsl-load
+dm_sdtm <- convert_blanks_to_na(pharmaversesdtm::dm)
+ds_sdtm <- convert_blanks_to_na(pharmaversesdtm::ds)
+ex_sdtm <- convert_blanks_to_na(pharmaversesdtm::ex)
+ae_sdtm <- convert_blanks_to_na(pharmaversesdtm::ae)
+vs_sdtm <- convert_blanks_to_na(pharmaversesdtm::vs)
+suppdm_sdtm <- convert_blanks_to_na(pharmaversesdtm::suppdm)
+
+dm_suppdm <- combine_supp(dm_sdtm, suppdm_sdtm)
+
+metacore_obj <- suppressWarnings(
+  spec_to_metacore(path = "metadata/safety_specs.xlsx", where_sep_sheet = FALSE) %>%
+    select_dataset("ADSL")
+)
+```
+
+```{r}
+#| label: adam-adsl-derive
+# Pull through SDTM columns per the spec
+adsl_preds <- build_from_derived(
+  metacore_obj,
+  ds_list = list("dm" = dm_suppdm, "suppdm" = dm_suppdm),
+  predecessor_only = FALSE, keep = FALSE
+)
+
+# Grouping variables: AGEGR1/AGEGR1N and RACEN
+adsl_ct <- adsl_preds %>%
+  create_cat_var(metacore_obj, ref_var = AGE, grp_var = AGEGR1, num_grp_var = AGEGR1N) %>%
+  create_var_from_codelist(metacore = metacore_obj, input_var = RACE, out_var = RACEN)
+
+# Exposure derivations
+ex_ext <- ex_sdtm %>%
+  derive_vars_dtm(dtc = EXSTDTC, new_vars_prefix = "EXST") %>%
+  derive_vars_dtm(dtc = EXENDTC, new_vars_prefix = "EXEN", time_imputation = "last")
+
+adsl_raw <- adsl_ct %>%
+  derive_vars_merged(
+    dataset_add = ex_ext,
+    filter_add = (EXDOSE > 0 |
+      (EXDOSE == 0 & str_detect(EXTRT, "PLACEBO"))) & !is.na(EXSTDTM),
+    new_vars = exprs(TRTSDTM = EXSTDTM, TRTSTMF = EXSTTMF),
+    order = exprs(EXSTDTM, EXSEQ),
+    mode = "first",
+    by_vars = exprs(STUDYID, USUBJID)
+  ) %>%
+  derive_vars_merged(
+    dataset_add = ex_ext,
+    filter_add = (EXDOSE > 0 |
+      (EXDOSE == 0 & str_detect(EXTRT, "PLACEBO"))) & !is.na(EXENDTM),
+    new_vars = exprs(TRTEDTM = EXENDTM, TRTETMF = EXENTMF),
+    order = exprs(EXENDTM, EXSEQ),
+    mode = "last",
+    by_vars = exprs(STUDYID, USUBJID)
+  ) %>%
+  derive_vars_dtm_to_dt(source_vars = exprs(TRTSDTM, TRTEDTM)) %>%
+  derive_vars_dtm_to_tm(source_vars = exprs(TRTSDTM)) %>%
+  derive_var_trtdurd() %>%
+  derive_var_merged_exist_flag(
+    dataset_add = ex_sdtm,
+    by_vars = exprs(STUDYID, USUBJID),
+    new_var = SAFFL,
+    false_value = "N",
+    missing_value = "N",
+    condition = (EXDOSE > 0 | (EXDOSE == 0 & str_detect(EXTRT, "PLACEBO")))
+  )
+
+# Treatment variables
+adsl <- adsl_raw %>%
+  mutate(
+    TRT01P = if_else(ARM %in% c("Screen Failure", "Not Assigned", "Not Treated"), "No Treatment", ARM),
+    TRT01A = if_else(ACTARM %in% c("Screen Failure", "Not Assigned", "Not Treated"), "No Treatment", ACTARM)
+  ) %>%
+  create_var_from_codelist(metacore_obj, input_var = TRT01P, out_var = TRT01PN) %>%
+  create_var_from_codelist(metacore_obj, input_var = TRT01A, out_var = TRT01AN)
+
+# Disposition variables
+ds_ext <- derive_vars_dt(ds_sdtm, dtc = DSSTDTC, new_vars_prefix = "DSST")
+
+adsl <- adsl %>%
+  derive_vars_merged(
+    dataset_add = ds_ext,
+    by_vars = exprs(STUDYID, USUBJID),
+    new_vars = exprs(EOSDT = DSSTDT),
+    filter_add = DSCAT == "DISPOSITION EVENT" & DSDECOD != "SCREEN FAILURE"
+  )
+
+format_eosstt <- function(x) {
+  case_when(
+    x %in% c("COMPLETED") ~ "COMPLETED",
+    x %in% c("SCREEN FAILURE") ~ NA_character_,
+    TRUE ~ "DISCONTINUED"
+  )
+}
+
+adsl <- adsl %>%
+  derive_vars_merged(
+    dataset_add = ds_sdtm,
+    by_vars = exprs(STUDYID, USUBJID),
+    filter_add = DSCAT == "DISPOSITION EVENT",
+    new_vars = exprs(EOSSTT = format_eosstt(DSDECOD)),
+    missing_values = exprs(EOSSTT = "ONGOING")
+  ) %>%
+  derive_vars_dt(
+    new_vars_prefix = "DTH",
+    dtc = DTHDTC,
+    highest_imputation = "M",
+    date_imputation = "first"
+  ) %>%
+  derive_vars_merged(
+    dataset_add = ds_ext,
+    by_vars = exprs(STUDYID, USUBJID),
+    new_vars = exprs(RANDDT = DSSTDT),
+    filter_add = DSDECOD == "RANDOMIZED"
+  ) %>%
+  derive_vars_merged(
+    dataset_add = ds_ext,
+    by_vars = exprs(STUDYID, USUBJID),
+    new_vars = exprs(SCRFDT = DSSTDT),
+    filter_add = DSCAT == "DISPOSITION EVENT" & DSDECOD == "SCREEN FAILURE"
+  ) %>%
+  derive_vars_merged(
+    dataset_add = ds_ext,
+    by_vars = exprs(STUDYID, USUBJID),
+    new_vars = exprs(FRVDT = DSSTDT),
+    filter_add = DSCAT == "OTHER EVENT" & DSDECOD == "FINAL RETRIEVAL VISIT"
+  ) %>%
+  derive_vars_duration(new_var = DTHADY, start_date = TRTSDT, end_date = DTHDT) %>%
+  derive_vars_duration(new_var = LDDTHELD, start_date = TRTEDT, end_date = DTHDT, add_one = FALSE)
+
+assign_randfl <- function(x) if_else(!is.na(x), "Y", NA_character_)
+adsl <- adsl %>% mutate(RANDFL = assign_randfl(RANDDT))
+
+# Cause of death
+adsl <- adsl %>%
+  derive_vars_extreme_event(
+    by_vars = exprs(STUDYID, USUBJID),
+    events = list(
+      event(
+        dataset_name = "ae",
+        condition = AEOUT == "FATAL",
+        set_values_to = exprs(DTHCAUS = AEDECOD, DTHDOM = "AE"),
+      ),
+      event(
+        dataset_name = "ds",
+        condition = DSDECOD == "DEATH" & grepl("DEATH DUE TO", DSTERM),
+        set_values_to = exprs(DTHCAUS = DSTERM, DTHDOM = "DS"),
+      )
+    ),
+    source_datasets = list(ae = ae_sdtm, ds = ds_sdtm),
+    tmp_event_nr_var = event_nr,
+    order = exprs(event_nr),
+    mode = "first",
+    new_vars = exprs(DTHCAUS, DTHDOM)
+  )
+```
+
+```{r}
+#| label: adam-adsl-finalize
+dir.create("output", showWarnings = FALSE)
+
+adsl_final <- adsl %>%
+  drop_unspec_vars(metacore_obj) %>%
+  check_variables(metacore_obj) %>%
+  check_ct_data(metacore_obj, na_acceptable = TRUE) %>%
+  order_cols(metacore_obj) %>%
+  sort_by_key(metacore_obj) %>%
+  xportr_type(metacore_obj, domain = "ADSL") %>%
+  xportr_length(metacore_obj) %>%
+  xportr_label(metacore_obj) %>%
+  xportr_df_label(metacore_obj)
+
+xportr_write(adsl_final, "output/adsl.xpt", metadata = metacore_obj, domain = "ADSL")
+```
+
+`ADSL` has `{r} nrow(adsl_final)` subjects and `{r} ncol(adsl_final)` variables:
+
+```{r}
+#| label: adam-adsl-preview
+adsl_final %>%
+  select(USUBJID, AGE, AGEGR1, SEX, RACE, ARM, ACTARM, TRT01A, SAFFL, TRTSDT, TRTEDT) %>%
+  head(10)
+```
+
+### ADAE (adverse events analysis dataset)
+
+`ADAE` starts from the SDTM `AE` domain, merges key `ADSL` dates, derives analysis dates/durations, flags (treatment-emergent, on-treatment, first-occurrence-of-worst-severity), and query variables (SMQs/CQs), and finally applies the same metadata/eSub steps as `ADSL`.
+
+```{r}
+#| label: adam-adae-derive
+adsl_for_ae <- adsl_final
+
+adsl_vars <- exprs(TRTSDT, TRTEDT, DTHDT)
+
+adae <- ae_sdtm %>%
+  derive_vars_merged(
+    dataset_add = adsl_for_ae,
+    new_vars = adsl_vars,
+    by_vars = exprs(STUDYID, USUBJID)
+  )
+
+# Analysis dates and relative day
+adae <- adae %>%
+  derive_vars_dt(
+    new_vars_prefix = "AEN",
+    dtc = AEENDTC,
+    date_imputation = "last",
+    highest_imputation = "M",
+    flag_imputation = "auto"
+  ) %>%
+  derive_vars_dt(
+    new_vars_prefix = "AST",
+    dtc = AESTDTC,
+    highest_imputation = "M",
+    flag_imputation = "auto",
+    min_dates = exprs(TRTSDT),
+    max_dates = exprs(AENDT)
+  ) %>%
+  derive_vars_dy(
+    reference_date = TRTSDT,
+    source_vars = exprs(ASTDT, AENDT)
+  )
+
+# Duration
+adae <- adae %>%
+  derive_vars_duration(
+    new_var = ADURN,
+    new_var_unit = ADURU,
+    start_date = ASTDT,
+    end_date = AENDT
+  )
+
+# Date of last dose before each AE
+ex_sdtm <- ex_sdtm %>% derive_vars_dt(dtc = EXENDTC, new_vars_prefix = "EXEN")
+
+adae <- adae %>%
+  derive_vars_joined(
+    dataset_add = ex_sdtm,
+    by_vars = exprs(STUDYID, USUBJID),
+    order = exprs(EXENDT),
+    new_vars = exprs(LDOSEDT = EXENDT),
+    join_vars = exprs(EXENDT),
+    join_type = "all",
+    filter_add = (EXDOSE > 0 | (EXDOSE == 0 & str_detect(EXTRT, "PLACEBO"))) & !is.na(EXENDT),
+    filter_join = EXENDT <= ASTDT,
+    mode = "last"
+  )
+
+# Analysis flags
+adae <- adae %>%
+  derive_var_trtemfl(
+    start_date = ASTDT,
+    end_date = AENDT,
+    trt_start_date = TRTSDT,
+    trt_end_date = TRTEDT
+  ) %>%
+  derive_var_ontrtfl(
+    start_date = ASTDT,
+    ref_start_date = TRTSDT,
+    ref_end_date = TRTEDT,
+    ref_end_window = 30
+  )
+
+# Occurrence flag: first occurrence of worst severity per patient
+adae <- adae %>%
+  mutate(TEMP_AESEVN = as.integer(factor(AESEV, levels = c("SEVERE", "MODERATE", "MILD")))) %>%
+  derive_var_extreme_flag(
+    new_var = AOCCIFL,
+    by_vars = exprs(STUDYID, USUBJID),
+    order = exprs(TEMP_AESEVN, ASTDT, AESEQ),
+    mode = "first"
+  ) %>%
+  select(-TEMP_AESEVN)
+
+# Query variables (SMQs/CQs)
+queries <- admiral::queries %>% filter(PREFIX %in% c("CQ01", "SMQ02"))
+
+adae <- adae %>%
+  derive_vars_query(dataset_queries = queries)
+
+# Remaining ADSL variables
+adae <- adae %>%
+  derive_vars_merged(
+    dataset_add = select(adsl_for_ae, !!!negate_vars(adsl_vars)),
+    by_vars = exprs(STUDYID, USUBJID)
+  )
+```
+
+```{r}
+#| label: adam-adae-finalize
+metacore_obj <- suppressWarnings(
+  spec_to_metacore(path = "metadata/safety_specs.xlsx", where_sep_sheet = FALSE) %>%
+    select_dataset("ADAE")
+)
+
+adae_final <- adae %>%
+  drop_unspec_vars(metacore_obj) %>%
+  check_variables(metacore_obj) %>%
+  check_ct_data(metacore_obj, na_acceptable = TRUE) %>%
+  order_cols(metacore_obj) %>%
+  sort_by_key(metacore_obj) %>%
+  xportr_type(metacore_obj, domain = "ADAE") %>%
+  xportr_length(metacore_obj) %>%
+  xportr_label(metacore_obj) %>%
+  xportr_df_label(metacore_obj)
+
+xportr_write(adae_final, "output/adae.xpt", metadata = metacore_obj, domain = "ADAE")
+```
+
+`ADAE` has `{r} nrow(adae_final)` adverse event records:
+
+```{r}
+#| label: adam-adae-preview
+adae_final %>%
+  select(USUBJID, ASTDT, AENDT, ADURN, TRTEMFL, ONTRTFL, AOCCIFL) %>%
+  head(10)
+```
+
+## TLG: tables
+
+### Demographics table
+
+Built with `{rtables}`/`{tern}` from `ADSL`: age (continuous summary), age group, sex, and race, split by actual treatment arm with an overall column.
+
+```{r}
+#| label: tlg-demographic-table
+adsl_demo <- adsl_final %>%
+  filter(!ACTARM %in% "Screen Failure") %>%
+  mutate(
+    AGEGR1 = case_when(
+      between(AGE, 18, 40) ~ "18-40",
+      between(AGE, 41, 64) ~ "41-64",
+      AGE > 64 ~ ">=65"
+    ) %>%
+      factor(levels = c("18-40", "41-64", ">=65"))
+  ) %>%
+  df_explicit_na()
+
+demo_vars <- c("AGE", "AGEGR1", "SEX", "RACE")
+demo_var_labels <- c("Age (yr)", "Age group", "Sex", "Race")
+
+lyt_demo <- basic_table(show_colcounts = TRUE) %>%
+  split_cols_by(var = "ACTARM") %>%
+  add_overall_col("All Patients") %>%
+  analyze_vars(vars = demo_vars, var_labels = demo_var_labels)
+
+demographic_table <- build_table(lyt_demo, adsl_demo)
+demographic_table
+```
+
+```{r}
+#| label: tlg-demographic-pdf
+export_as_pdf(
+  demographic_table,
+  file = "output/demographic_table.pdf",
+  page_type = "letter",
+  landscape = TRUE,
+  font_size = 9,
+  margins = c(2, 2, 2, 2)
+)
+```
+
+### Adverse events table
+
+Built with `{rtables}`/`{tern}` from `{pharmaverseadam}`'s `ADSL`/`ADAE` (see [Scope](#scope) above): total patients/events overall, then by System Organ Class (`AEBODSYS`) and Preferred Term (`AEDECOD`), restricted to the safety population.
+
+```{r}
+#| label: tlg-ae-table
+adsl_pkg <- pharmaverseadam::adsl %>% df_explicit_na()
+adae_pkg <- pharmaverseadam::adae %>%
+  var_relabel(
+    AEBODSYS = "MedDRA System Organ Class",
+    AEDECOD = "MedDRA Preferred Term"
+  ) %>%
+  filter(SAFFL == "Y") %>%
+  df_explicit_na()
+
+lyt_ae <- basic_table(show_colcounts = TRUE) %>%
+  split_cols_by(var = "ACTARM") %>%
+  add_overall_col(label = "All Patients") %>%
+  analyze_num_patients(
+    vars = "USUBJID",
+    .stats = c("unique", "nonunique"),
+    .labels = c(
+      unique = "Total number of patients with at least one adverse event",
+      nonunique = "Overall total number of events"
+    )
+  ) %>%
+  split_rows_by(
+    "AEBODSYS",
+    child_labels = "visible",
+    nested = FALSE,
+    split_fun = drop_split_levels,
+    label_pos = "topleft",
+    split_label = obj_label(adae_pkg$AEBODSYS)
+  ) %>%
+  summarize_num_patients(
+    var = "USUBJID",
+    .stats = c("unique", "nonunique"),
+    .labels = c(
+      unique = "Total number of patients with at least one adverse event",
+      nonunique = "Total number of events"
+    )
+  ) %>%
+  count_occurrences(
+    vars = "AEDECOD",
+    .indent_mods = -1L
+  ) %>%
+  append_varlabels(adae_pkg, "AEDECOD", indent = 1L)
+
+adverse_events_table <- build_table(lyt_ae, df = adae_pkg, alt_counts_df = adsl_pkg)
+adverse_events_table
+```
+
+::: {.callout-tip}
+The PDF export below can print a handful of benign "height exceeds available space" warnings on individual pages -- an artifact of `{rtables}` keeping each System Organ Class's Preferred Term rows from splitting across a page boundary. The PDF is still complete and correctly paginated.
+:::
+
+```{r}
+#| label: tlg-ae-pdf
+export_as_pdf(
+  adverse_events_table,
+  file = "output/adverse_events_table.pdf",
+  page_type = "letter",
+  landscape = TRUE,
+  font_size = 8,
+  margins = c(2, 2, 2, 2)
+)
+```
+
+## TLG: supporting plots
+
+### Age distribution by treatment arm
+
+```{r}
+#| label: tlg-plot-age
+#| fig-cap: "Age distribution by treatment arm, ADSL safety population"
+#| fig-width: 8
+#| fig-height: 5
+adsl_plot <- adsl_final %>%
+  filter(!ACTARM %in% "Screen Failure")
+
+p_age <- ggplot(adsl_plot, aes(x = ACTARM, y = AGE)) +
+  geom_boxplot(width = 0.5, outlier.shape = NA) +
+  geom_jitter(width = 0.15, alpha = 0.4, size = 1.5) +
+  labs(
+    title = "Age distribution by treatment arm",
+    subtitle = "ADSL, Safety Population",
+    x = NULL, y = "Age (years)"
+  ) +
+  theme_minimal(base_size = 12)
+
+ggsave("output/figures/age_by_arm.png", p_age, width = 8, height = 5, dpi = 150, create.dir = TRUE)
+p_age
+```
+
+### Adverse event incidence by System Organ Class
+
+The top 10 SOCs by overall incidence, shown as the percentage of patients in each arm with at least one event -- a graphical companion to the Adverse Events table above.
+
+```{r}
+#| label: tlg-plot-ae-soc
+#| fig-cap: "AE incidence by System Organ Class, top 10 SOCs, safety population"
+#| fig-width: 9
+#| fig-height: 6
+adsl_ae <- pharmaverseadam::adsl %>% filter(SAFFL == "Y")
+adae_ae <- pharmaverseadam::adae %>% filter(SAFFL == "Y")
+
+n_by_arm <- adsl_ae %>%
+  count(ACTARM, name = "n_subj")
+
+top_soc <- adae_ae %>%
+  distinct(USUBJID, AEBODSYS) %>%
+  count(AEBODSYS, name = "n") %>%
+  slice_max(n, n = 10) %>%
+  pull(AEBODSYS)
+
+ae_soc_pct <- adae_ae %>%
+  filter(AEBODSYS %in% top_soc) %>%
+  distinct(USUBJID, ACTARM, AEBODSYS) %>%
+  count(ACTARM, AEBODSYS, name = "n_pts") %>%
+  left_join(n_by_arm, by = "ACTARM") %>%
+  mutate(pct = n_pts / n_subj)
+
+p_ae_soc <- ggplot(
+  ae_soc_pct,
+  aes(x = pct, y = reorder(AEBODSYS, pct), fill = ACTARM)
+) +
+  geom_col(position = position_dodge(width = 0.8), width = 0.7) +
+  scale_x_continuous(labels = percent_format(accuracy = 1)) +
+  labs(
+    title = "Adverse event incidence by System Organ Class",
+    subtitle = "Top 10 SOCs by overall incidence, Safety Population",
+    x = "% of patients with >= 1 event", y = NULL, fill = "Treatment"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(legend.position = "bottom")
+
+ggsave("output/figures/ae_incidence_by_soc.png", p_ae_soc, width = 9, height = 6, dpi = 150, create.dir = TRUE)
+p_ae_soc
+```
+
+```{r}
+#| label: tlg-plots-pdf
+pdf("output/figures.pdf", width = 9, height = 6)
+print(p_age)
+print(p_ae_soc)
+invisible(dev.off())
+```
+
+## Output artifacts
+
+All outputs generated by this pipeline (and re-created by this report) are written under `output/`:
+
+| File | Description |
+| --- | --- |
+| `output/adsl.xpt` | `ADSL`, submission-ready SAS transport file |
+| `output/adae.xpt` | `ADAE`, submission-ready SAS transport file |
+| `output/demographic_table.pdf` | Demographics table (PDF) |
+| `output/adverse_events_table.pdf` | Adverse events table (PDF, multi-page landscape) |
+| `output/figures/age_by_arm.png` | Age distribution by treatment arm |
+| `output/figures/ae_incidence_by_soc.png` | AE incidence by System Organ Class |
+| `output/figures.pdf` | Both plots combined, one per page |
+
+## Session information
+
+```{r}
+#| label: session-info
+sessionInfo()
+```

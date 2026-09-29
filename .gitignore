@@ -1,0 +1,21 @@
+# R
+.Rproj.user/
+.Rhistory
+.RData
+.Rdata
+.httr-oauth
+.DS_Store
+
+# Quarto
+.quarto/
+*_files/
+!pipeline_report_files/
+
+# renv (project-level; teal_app/renv has its own .gitignore for library/)
+renv/library/
+renv/local/
+renv/cellar/
+renv/lock/
+renv/python/
+renv/sandbox/
+renv/staging/
